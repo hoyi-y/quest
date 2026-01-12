@@ -16,7 +16,7 @@ import argparse
 from evaluation.quest_attention import enable_quest_attention_eval
 from evaluation.llama import enable_tuple_kv_cache_for_llama 
 from evaluation.mistral import enable_tuple_kv_cache_for_mistral
-from evaluation.qwen import enable_tuple_kv_cache_for_qwen
+from evaluation.qwen import enable_tuple_kv_cache_for_qwen3
 
 
 def parse_args(args=None):
@@ -73,9 +73,29 @@ def build_chat(tokenizer, prompt, model_name):
         prompt = header + f" ### Human: {prompt}\n###"
     elif "internlm" in model_name:
         prompt = f"<|User|>:{prompt}<eoh>\n<|Bot|>:"
+    # elif "qwen" in model_name:
+    #     # 标准的 ChatML 格式实现
+    #     prompt = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
     elif "qwen" in model_name:
-        # 标准的 ChatML 格式实现
-        prompt = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    # 1. 去掉通用的 System Prompt，减少干扰
+    # 或者把 system 改成 "You are a precise answering machine."
+        system_part = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n" 
+        
+        # 2. 这里的 prompt 变量本身已经包含了 Context + Question
+        user_part = f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        
+        # 3. 【关键修改】在 assistant 后面预填 "Answer:" (针对 QA 任务)
+        # 这样模型为了续写，就不需要自己生成 "Answer:"，也就不会陷入重复 "Answer:" 的死循环
+        # 注意：这取决于你的 prompt 最后是不是已经有了 "Answer:"，如果有，这里就不用加
+        if not prompt.strip().endswith("Answer:"):
+            assistant_part = "<|im_start|>assistant\n"
+        else:
+            # 如果原文结尾已经是 Question: ... Answer: 
+            # 那么我们只需要给个头让它接龙
+            assistant_part = "<|im_start|>assistant\n"
+
+        # 组合
+        prompt = f"{system_part}{user_part}{assistant_part}"
     return prompt
 
 
@@ -196,13 +216,40 @@ def get_pred(
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
+                    # print("max_gen变化………………………………")
 
                     past_key_values = outputs.past_key_values
                     pred_token_idx = (
                         outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
                     )
                     generated_content += [pred_token_idx.item()]
-                    if pred_token_idx.item() == tokenizer.eos_token_id:
+                    stop_token_ids = set()
+
+                    # 1. 添加默认的 EOS (通常是 151643 <|endoftext|>)
+                    if tokenizer.eos_token_id is not None:
+                        stop_token_ids.add(tokenizer.eos_token_id)
+
+                    # 2. 【必需】添加 ChatML 专用停止符 <|im_end|> (通常是 151645)
+                    # 很多时候 tokenizer.eos_token_id 不包含这个，导致 Chat 模型停不下来
+                    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+                    if isinstance(im_end_id, int):
+                        stop_token_ids.add(im_end_id)
+
+                    # 3. 【必需】添加 Base 模型结束符 <|endoftext|> (作为双重保险)
+                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+                    if isinstance(endoftext_id, int):
+                        stop_token_ids.add(endoftext_id)
+
+                    # 4. 【强烈建议】添加 "换行符" (针对 QA 评测)
+                    # 作用：防止模型回答完一个问题后，换行继续编造 "Answer: ..."
+                    # newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
+                    # stop_token_ids.add(newline_id)
+                    # print(pred_token_idx.item()) 
+                    # print(tokenizer.decode([pred_token_idx.item()]))
+                    # stop_token_ids = {tokenizer.eos_token_id, 151645, 151668} # Qwen3 特定的停止符
+                    # if True:
+                    if pred_token_idx.item() in stop_token_ids:
+                        # print(f"检测到停止符: {pred_token_idx.item()}")
                         break
 
             # output = model.generate(
@@ -242,8 +289,8 @@ def load_model_and_tokenizer(path, model_name, device):
         enable_tuple_kv_cache_for_llama()
     if 'mistral' in model_name.lower():
         enable_tuple_kv_cache_for_mistral()
-    if 'qwen' in model_name.lower():
-        enable_tuple_kv_cache_for_qwen()
+    # if 'qwen' in model_name.lower():
+    #     enable_tuple_kv_cache_for_qwen()
         
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -338,3 +385,6 @@ if __name__ == "__main__":
             for pred in preds:
                 json.dump(pred, f, ensure_ascii=False)
                 f.write("\n")
+        if True:
+            break       
+
