@@ -16,7 +16,7 @@ import argparse
 from evaluation.quest_attention import enable_quest_attention_eval
 from evaluation.llama import enable_tuple_kv_cache_for_llama 
 from evaluation.mistral import enable_tuple_kv_cache_for_mistral
-from evaluation.qwen import enable_tuple_kv_cache_for_qwen3
+from evaluation.qwen3 import enable_tuple_kv_cache_for_qwen3
 
 
 def parse_args(args=None):
@@ -73,29 +73,16 @@ def build_chat(tokenizer, prompt, model_name):
         prompt = header + f" ### Human: {prompt}\n###"
     elif "internlm" in model_name:
         prompt = f"<|User|>:{prompt}<eoh>\n<|Bot|>:"
-    # elif "qwen" in model_name:
-    #     # 标准的 ChatML 格式实现
-    #     prompt = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    elif "qwen" in model_name:
-    # 1. 去掉通用的 System Prompt，减少干扰
-    # 或者把 system 改成 "You are a precise answering machine."
-        system_part = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n" 
-        
-        # 2. 这里的 prompt 变量本身已经包含了 Context + Question
-        user_part = f"<|im_start|>user\n{prompt}<|im_end|>\n"
-        
-        # 3. 【关键修改】在 assistant 后面预填 "Answer:" (针对 QA 任务)
-        # 这样模型为了续写，就不需要自己生成 "Answer:"，也就不会陷入重复 "Answer:" 的死循环
-        # 注意：这取决于你的 prompt 最后是不是已经有了 "Answer:"，如果有，这里就不用加
-        if not prompt.strip().endswith("Answer:"):
-            assistant_part = "<|im_start|>assistant\n"
-        else:
-            # 如果原文结尾已经是 Question: ... Answer: 
-            # 那么我们只需要给个头让它接龙
-            assistant_part = "<|im_start|>assistant\n"
-
-        # 组合
-        prompt = f"{system_part}{user_part}{assistant_part}"
+    elif "qwen3" in model_name or "qwen" in model_name:
+        prompt = (
+            "<|im_start|>system\n"
+            "You are a helpful assistant.\n"
+            "<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"{prompt}\n"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
     return prompt
 
 
@@ -159,9 +146,14 @@ def get_pred(
         # max simulation length is 100
         q_pos = max(len(prompt) - 100, q_pos)
 
-        if q_pos != None:
+        # if q_pos != None:
+        #     question = prompt[q_pos:]
+        #     prompt = prompt[:q_pos]
+        if q_pos is not None and q_pos >= 0:
             question = prompt[q_pos:]
             prompt = prompt[:q_pos]
+        else:
+            question = ""    
 
         if "chatglm3" in model_name:
             # input = prompt.to(device)
@@ -290,7 +282,7 @@ def load_model_and_tokenizer(path, model_name, device):
     if 'mistral' in model_name.lower():
         enable_tuple_kv_cache_for_mistral()
     # if 'qwen' in model_name.lower():
-    #     enable_tuple_kv_cache_for_qwen()
+    #     enable_tuple_kv_cache_for_qwen3()
         
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -299,6 +291,7 @@ def load_model_and_tokenizer(path, model_name, device):
     model = model.eval()
 
     if args.quest:
+        print("enable quest-------")
         enable_quest_attention_eval(model, args)
 
     return model, tokenizer
