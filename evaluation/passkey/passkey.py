@@ -12,6 +12,7 @@ from tqdm.contrib import tenumerate
 
 from evaluation.llama import enable_tuple_kv_cache_for_llama
 from evaluation.mistral import enable_tuple_kv_cache_for_mistral
+from evaluation.qwen3 import enable_tuple_kv_cache_for_qwen3
 
 # from https://github.com/epfml/landmark-attention/blob/main/llama/run_test.py
 
@@ -169,6 +170,8 @@ def main(args):
             enable_tuple_kv_cache_for_llama()
         if 'mistral' in model.lower():
             enable_tuple_kv_cache_for_mistral()
+        # if 'qwen' in model.lower():
+        #     enable_tuple_kv_cache_for_qwen3()
 
         loaded = AutoModelForCausalLM.from_pretrained(
             model,

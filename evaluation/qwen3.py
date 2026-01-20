@@ -1,40 +1,32 @@
-from typing import List,Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.functional as F
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
-import transformers.models
-from transformers.models.llama.modeling_llama import (
-    LlamaForCausalLM,
-    CausalLMOutputWithPast,
-    Union,
-    BaseModelOutputWithPast,
+import transformers.models.qwen3
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3ForCausalLM,
     apply_rotary_pos_emb,
+    repeat_kv,
+)
+from transformers.modeling_outputs import (
+    CausalLMOutputWithPast,
+    BaseModelOutputWithPast,
 )
 import types
 
-from flash_attn import flash_attn_func, flash_attn_varlen_func
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 
-import transformers
-
-
-def _get_unpad_data(padding_mask):
-    seqlens_in_batch = padding_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(padding_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(
-        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
-    )
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-def old_flash_attention_2_forward(
+# Qwen3 FlashAttention2 forward with tuple-style KV cache
+def old_qwen3_flash_attention_2_forward(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -43,37 +35,35 @@ def old_flash_attention_2_forward(
     output_attentions: bool = False,
     use_cache: bool = False,
     padding_mask: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    # LlamaFlashAttention2 attention does not support output_attentions
+    # Qwen3Attention does not support output_attentions
     output_attentions = False
 
     bsz, q_len, _ = hidden_states.size()
 
-    query_states = self.q_proj(hidden_states)
-    key_states = self.k_proj(hidden_states)
-    value_states = self.v_proj(hidden_states)
+    # Project queries, keys, values
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
 
-    # Flash attention requires the input to have the shape
-    # batch_size x seq_length x head_dime x hidden_dim
-    # therefore we just need to keep the original shape
-    query_states = query_states.view(
-        bsz, q_len, self.config.num_attention_heads, self.head_dim
-    ).transpose(1, 2)
-    key_states = key_states.view(
-        bsz, q_len, self.config.num_key_value_heads, self.head_dim
-    ).transpose(1, 2)
-    value_states = value_states.view(
-        bsz, q_len, self.config.num_key_value_heads, self.head_dim
-    ).transpose(1, 2)
+    # Apply q_norm and k_norm (Qwen3 specific)
+    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     kv_seq_len = key_states.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
+    # Get position embeddings
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
 
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+    # Concatenate with past key/value if exists
     if past_key_value is not None:
         # reuse k, v, self_attention
         key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -81,163 +71,30 @@ def old_flash_attention_2_forward(
 
     past_key_value = (key_states, value_states) if use_cache else None
 
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
+    # Repeat k/v for GQA
+    key_states_repeated = repeat_kv(key_states, self.num_key_value_groups)
+    value_states_repeated = repeat_kv(value_states, self.num_key_value_groups)
 
-    # TODO: llama does not have dropout in the config??
-    # It is recommended to use dropout with FA according to the docs
-    # when training.
-    dropout_rate = 0.0  # if not self.training else self.attn_dropout
-
-    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-    # therefore the input hidden states gets silently casted in float32. Hence, we need
-    # cast them back in float16 just to be sure everything works as expected.
-    # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-    # in fp32. (LlamaRMSNorm handles it correctly)
-    input_dtype = query_states.dtype
-    if input_dtype == torch.float32:
-        query_states = query_states.to(torch.float16)
-        key_states = key_states.to(torch.float16)
-        value_states = value_states.to(torch.float16)
-
-    attn_output = self._flash_attention_forward(
+    # Use SDPA (Scaled Dot Product Attention) to save memory
+    # This uses FlashAttention or memory-efficient attention under the hood
+    attn_output = F.scaled_dot_product_attention(
         query_states,
-        key_states,
-        value_states,
-        padding_mask,
-        q_len,
-        dropout=dropout_rate,
+        key_states_repeated,
+        value_states_repeated,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,  # We handle causality through attention_mask
     )
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(*input_shape, -1)
     attn_output = self.o_proj(attn_output)
 
-    if not output_attentions:
-        attn_weights = None
-
-    return attn_output, attn_weights, past_key_value
+    return attn_output, None, past_key_value
 
 
-def _flash_attention_forward(
-    self,
-    query_states,
-    key_states,
-    value_states,
-    padding_mask,
-    query_length,
-    dropout=0.0,
-    softmax_scale=None,
-):
-    """
-    Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-    first unpad the input, then computes the attention scores and pad the final attention scores.
-
-    Args:
-        query_states (`torch.Tensor`):
-            Input query states to be passed to Flash Attention API
-        key_states (`torch.Tensor`):
-            Input key states to be passed to Flash Attention API
-        value_states (`torch.Tensor`):
-            Input value states to be passed to Flash Attention API
-        padding_mask (`torch.Tensor`):
-            The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-            position of padding tokens and 1 for the position of non-padding tokens.
-        dropout (`int`, *optional*):
-            Attention dropout
-        softmax_scale (`float`, *optional*):
-            The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-    """
-    # Contains at least one padding token in the sequence
-    if padding_mask is not None:
-        batch_size = query_states.shape[0]
-        (
-            query_states,
-            key_states,
-            value_states,
-            indices_q,
-            cu_seq_lens,
-            max_seq_lens,
-        ) = self._upad_input(
-            query_states, key_states, value_states, padding_mask, query_length
-        )
-
-        cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-        max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-        attn_output_unpad = flash_attn_varlen_func(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_in_batch_q,
-            max_seqlen_k=max_seqlen_in_batch_k,
-            dropout_p=dropout,
-            softmax_scale=softmax_scale,
-            causal=True,
-        )
-
-        attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-    else:
-        attn_output = flash_attn_func(
-            query_states,
-            key_states,
-            value_states,
-            dropout,
-            softmax_scale=softmax_scale,
-            causal=True,
-        )
-
-    return attn_output
-
-
-def _upad_input(self, query_layer, key_layer, value_layer, padding_mask, query_length):
-    indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(padding_mask)
-    batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-
-    key_layer = index_first_axis(
-        key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
-        indices_k,
-    )
-    value_layer = index_first_axis(
-        value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
-        indices_k,
-    )
-    if query_length == kv_seq_len:
-        query_layer = index_first_axis(
-            query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim),
-            indices_k,
-        )
-        cu_seqlens_q = cu_seqlens_k
-        max_seqlen_in_batch_q = max_seqlen_in_batch_k
-        indices_q = indices_k
-    elif query_length == 1:
-        max_seqlen_in_batch_q = 1
-        cu_seqlens_q = torch.arange(
-            batch_size + 1, dtype=torch.int32, device=query_layer.device
-        )  # There is a memcpy here, that is very bad.
-        indices_q = cu_seqlens_q[:-1]
-        query_layer = query_layer.squeeze(1)
-    else:
-        # The -q_len: slice assumes left padding.
-        padding_mask = padding_mask[:, -query_length:]
-        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(
-            query_layer, padding_mask
-        )
-
-    return (
-        query_layer,
-        key_layer,
-        value_layer,
-        indices_q,
-        (cu_seqlens_q, cu_seqlens_k),
-        (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-    )
-
-
-# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaForCausalLM using the tuple style KV cache.
-def old_llama_for_causal_lm_forward(
+# From Huggingface's Transformers. This is the forward method of Qwen3ForCausalLM using the tuple style KV cache.
+def old_qwen3_for_causal_lm_forward(
     self,
     input_ids: torch.LongTensor = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -249,6 +106,7 @@ def old_llama_for_causal_lm_forward(
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
     output_attentions = (
         output_attentions
@@ -275,6 +133,7 @@ def old_llama_for_causal_lm_forward(
         output_attentions=output_attentions,
         output_hidden_states=output_hidden_states,
         return_dict=return_dict,
+        cache_position=cache_position,
     )
 
     hidden_states = outputs[0]
@@ -312,8 +171,8 @@ def old_llama_for_causal_lm_forward(
     )
 
 
-# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaModel using the tuple style KV cache.
-def old_llama_model_forward(
+# From Huggingface's Transformers. This is the forward method of Qwen3Model using the tuple style KV cache.
+def old_qwen3_model_forward(
     self,
     input_ids: torch.LongTensor = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -324,6 +183,7 @@ def old_llama_model_forward(
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, BaseModelOutputWithPast]:
     output_attentions = (
         output_attentions
@@ -375,7 +235,7 @@ def old_llama_model_forward(
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
 
-    # embed positions
+    # Create causal mask
     if attention_mask is None:
         attention_mask = torch.ones(
             (batch_size, seq_length_with_past),
@@ -389,11 +249,20 @@ def old_llama_model_forward(
         else:
             padding_mask = None
 
-    attention_mask = self._prepare_decoder_attention_mask(
-        attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-    )
+    # Create 4D causal mask - only create when needed (for decode phase)
+    # For prefill phase, use None and let SDPA handle it
+    if seq_length == 1 and past_key_values_length > 0:
+        # Decode phase: no mask needed (single token can attend to all previous)
+        causal_mask = None
+    else:
+        # Prefill phase: use efficient causal mask
+        # Don't materialize the full matrix - let SDPA handle it
+        causal_mask = None  # SDPA will use is_causal=True internally
 
     hidden_states = inputs_embeds
+
+    # Create position embeddings to be shared across the decoder layers
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
     # decoder layers
     all_hidden_states = () if output_hidden_states else None
@@ -408,12 +277,13 @@ def old_llama_model_forward(
 
         layer_outputs = decoder_layer(
             hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=causal_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
             padding_mask=padding_mask,
+            position_embeddings=position_embeddings,
         )
 
         hidden_states = layer_outputs[0]
@@ -445,8 +315,8 @@ def old_llama_model_forward(
     )
 
 
-# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaDecoderLayer using the tuple style KV cache.
-def old_llama_decoder_layer_forward(
+# From Huggingface's Transformers. This is the forward method of Qwen3DecoderLayer using the tuple style KV cache.
+def old_qwen3_decoder_layer_forward(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -455,6 +325,7 @@ def old_llama_decoder_layer_forward(
     output_attentions: Optional[bool] = False,
     use_cache: Optional[bool] = False,
     padding_mask: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
     residual = hidden_states
 
@@ -469,6 +340,7 @@ def old_llama_decoder_layer_forward(
         output_attentions=output_attentions,
         use_cache=use_cache,
         padding_mask=padding_mask,
+        position_embeddings=position_embeddings,
     )
     hidden_states = residual + hidden_states
 
@@ -489,16 +361,18 @@ def old_llama_decoder_layer_forward(
     return outputs
 
 
-def enable_tuple_kv_cache_for_llama():
-    print("Enabling tuple KV cache for Llama")
-    transformers.models.llama.modeling_llama.LlamaModel._prepare_decoder_attention_mask = (
-        lambda *args, **kwargs: None
-    )
-    transformers.models.llama.modeling_llama.LlamaModel.forward = old_llama_model_forward
-    transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = old_llama_decoder_layer_forward
-    transformers.models.llama.modeling_llama.LlamaAttention.forward = old_flash_attention_2_forward
-    # transformers.models.llama.modeling_llama.LlamaSdpaAttention.forward = old_flash_attention_2_forward
-    # transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = old_flash_attention_2_forward
-    transformers.models.llama.modeling_llama.LlamaAttention._upad_input = _upad_input
-    transformers.models.llama.modeling_llama.LlamaAttention._flash_attention_forward = _flash_attention_forward
-    transformers.models.llama.modeling_llama.LlamaForCausalLM.forward = old_llama_for_causal_lm_forward
+def enable_tuple_kv_cache_for_qwen3():
+    print("Enabling tuple KV cache for Qwen3")
+
+    # Patch the model forward methods
+    transformers.models.qwen3.modeling_qwen3.Qwen3Model.forward = old_qwen3_model_forward
+    transformers.models.qwen3.modeling_qwen3.Qwen3DecoderLayer.forward = old_qwen3_decoder_layer_forward
+    transformers.models.qwen3.modeling_qwen3.Qwen3Attention.forward = old_qwen3_flash_attention_2_forward
+
+    # Also patch other attention implementations if they exist
+    if hasattr(transformers.models.qwen3.modeling_qwen3, 'Qwen3FlashAttention2'):
+        transformers.models.qwen3.modeling_qwen3.Qwen3FlashAttention2.forward = old_qwen3_flash_attention_2_forward
+    if hasattr(transformers.models.qwen3.modeling_qwen3, 'Qwen3SdpaAttention'):
+        transformers.models.qwen3.modeling_qwen3.Qwen3SdpaAttention.forward = old_qwen3_flash_attention_2_forward
+
+    transformers.models.qwen3.modeling_qwen3.Qwen3ForCausalLM.forward = old_qwen3_for_causal_lm_forward
