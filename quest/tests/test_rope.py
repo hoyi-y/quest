@@ -14,19 +14,54 @@ def assert_close(a, b):
     torch.testing.assert_close(a, b, rtol=rtol, atol=atol)
 
 # Ref: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
+from transformers import LlamaConfig
+import inspect
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, apply_rotary_pos_emb
+
 def _ref_apply_qk_rope(q, k, past_kv_len):
     # q,k: [seq_len, num_heads, head_dim]
     seq_len = q.size(0)
     num_heads = q.size(1)
     head_dim = q.size(2)
 
-    rotary_emb = LlamaRotaryEmbedding(head_dim).to(q.device)
-    cos, sin = rotary_emb(q, seq_len=seq_len + past_kv_len)
+    # ✅ 新版 transformers 的 LlamaRotaryEmbedding 往往需要 config（含 max_position_embeddings 等）
+    config = LlamaConfig(
+        hidden_size=num_heads * head_dim,
+        num_attention_heads=num_heads,
+        max_position_embeddings=seq_len + past_kv_len + 8,  # 留点余量，避免边界
+    )
+
+    # 兼容不同版本的 __init__ 签名
+    try:
+        rotary_emb = LlamaRotaryEmbedding(config=config).to(q.device)
+    except TypeError:
+        # 旧版可能仍支持 dim/base 方式（或参数名不同）
+        rotary_emb = LlamaRotaryEmbedding(head_dim).to(q.device)
+
     position_ids = torch.arange(
         past_kv_len, seq_len + past_kv_len, dtype=torch.long, device=q.device
+    )[None, :]  # [1, seq_len]
+
+    # 兼容不同版本 forward 的参数（有的用 position_ids，有的用 seq_len）
+    cos = sin = None
+    try:
+        # 常见新版：rotary_emb(x, position_ids)
+        cos, sin = rotary_emb(q.transpose(0, 1), position_ids)
+    except TypeError:
+        try:
+            # 有些版本：rotary_emb(x, seq_len=...)
+            cos, sin = rotary_emb(q.transpose(0, 1), seq_len=seq_len + past_kv_len)
+        except TypeError:
+            # 再退一步：rotary_emb(x, seq_len)
+            cos, sin = rotary_emb(q.transpose(0, 1), seq_len + past_kv_len)
+
+    # apply_rotary_pos_emb 期望输入是 [bs, heads, seq, dim] 或 [heads, seq, dim] 取决于版本
+    # 你原来用的是 q.transpose(0,1) => [heads, seq, dim]
+    query_states, key_states = apply_rotary_pos_emb(
+        q.transpose(0, 1), k.transpose(0, 1), cos, sin, position_ids
     )
-    position_ids = position_ids.unsqueeze(0).view(-1, seq_len)
-    query_states, key_states = apply_rotary_pos_emb(q.transpose(0, 1), k.transpose(0, 1), cos, sin, position_ids)
+
+    # 返回到原来的 [seq, heads, dim]
     return query_states.squeeze(0).transpose(0, 1), key_states.squeeze(0).transpose(0, 1)
 
 parameters = list(product(["float16"], [13, 24, 51, 77, 244, 311, 502, 1110], [2, 5, 7, 19, 31, 69, 111, 251]))

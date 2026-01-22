@@ -96,7 +96,12 @@ class InferenceController:
             # decode requests
             # append_kv_cache_decode, estimate_attn_score, topk_filtering
             cur_page_nums = len(self.kv_cache.indicies)
-            assert cur_page_nums > 1 # at least two pages for excluding last page
+            if cur_page_nums <= 1:
+                # No prior pages yet; treat as prefill to avoid decode path.
+                if updateTensor:
+                    self.kv_indices_with_last = torch.tensor(self.kv_cache.indicies, dtype=torch.int32, device=self.device)
+                    self.metadata_indices = torch.tensor(self.metadata_cache.indicies, dtype=torch.int32, device=self.device)
+                return
 
             if updateTensor:
                 # used for appending
@@ -135,6 +140,10 @@ class InferenceController:
         self._decode_handler.end_forward()
     
     def need_estimate(self) -> bool:
+        # topk_filtering kernel is compiled for a fixed head count (32).
+        # Fall back to full attention when head count is unsupported.
+        if self.num_heads != 32:
+            return False
         if self.inference_page_budget is None:
             return False
         

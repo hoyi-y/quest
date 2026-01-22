@@ -1,3 +1,4 @@
+import os
 import torch
 import math
 from typing import Optional
@@ -7,6 +8,14 @@ from quest.utils.utils import TensorLayout
 from quest.utils.kv_cache import KvCache
 from quest.utils.controller import InferenceController
 from quest.utils.decode_wrapper import BatchDecodeWithPagedKVCacheWrapper
+from quest.utils.triton_backend import (
+    triton_decode_estimate,
+    triton_decode_sparse_attn,
+    triton_decode_topk,
+    triton_prefill_forward,
+)
+
+_USE_TRITON = os.getenv("QUEST_USE_TRITON", "1") == "1"
 
 __all__ = [
     'TensorLayout',
@@ -154,6 +163,9 @@ def prefill_forward(
     if rope_theta is None:
         rope_theta = 1e4
 
+    # if _USE_TRITON:
+    #     return triton_prefill_forward(q, iController, layer_idx)
+
     f = _kernels.prefill_with_paged_kv_cache
     o = f(
         q,
@@ -189,6 +201,9 @@ def decode_estimate(
         iController: InferenceController object, which contains all needed information.
         layer_idx: Layer index of the KV cache.
     """
+    if _USE_TRITON:
+        return triton_decode_estimate(q, iController, layer_idx)
+
     f = _kernels.estimate_attn_score
     # (iController.metadata_cache.seqlen - 1) is manually excluding the last elements, which is the current page.
     o = torch.empty((iController.num_heads, iController.metadata_cache.seqlen - 1), dtype=q.dtype, device=q.device)
@@ -224,6 +239,10 @@ def decode_topk(
         iController: InferenceController object, which contains all needed information.
         layer_idx: Layer index of the KV cache.
     """
+    if _USE_TRITON:
+        triton_decode_topk(estimated_attn_score, iController)
+        return
+
     # excluding the last page
     page_budet = iController.inference_page_budget - 1
     f = _kernels.topk_filtering
@@ -261,6 +280,17 @@ def decode_sparse_attn(
         layer_idx: Layer index of the KV cache.
         topk_indices: Shape: `[N, page_budget-1]`. Top-k indices.
     """
+    if topk_indices is None or iController.kv_indptr_for_approx_decode is None:
+        return prefill_forward(
+            q,
+            iController,
+            layer_idx,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+        )
+    if _USE_TRITON:
+        return triton_decode_sparse_attn(q, iController, layer_idx, topk_indices)
+
     o = torch.empty_like(q, dtype=q.dtype, device=q.device)
     iController._decode_handler.forward(
         q,
