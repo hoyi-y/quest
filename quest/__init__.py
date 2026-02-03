@@ -1,4 +1,4 @@
-from quest.models import LlamaForCausalLM , Qwen3ForCausalLM
+from quest.models import LlamaForCausalLM , Qwen3ForCausalLM, Qwen3ForCausalLMTriton
 
 __version__ = "0.0.1"
 

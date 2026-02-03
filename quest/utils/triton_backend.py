@@ -1,7 +1,5 @@
 import importlib.util
 from pathlib import Path
-from typing import Tuple
-
 import torch
 
 _TRITON_MODULE = None
@@ -22,31 +20,28 @@ def _load_triton_module():
     return module
 
 
-def _materialize_kv(iController, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    kv_data = iController.kv_cache.buf_layer(layer_idx)
-    indices = iController.kv_cache.indicies
-    if len(indices) == 0:
+def _get_kv_indices(iController, device: torch.device) -> torch.Tensor:
+    if iController.kv_indices_with_last is not None:
+        return iController.kv_indices_with_last
+    if len(iController.kv_cache.indicies) == 0:
         raise ValueError("KV cache is empty.")
-
-    page_indices = torch.tensor(indices, device=kv_data.device, dtype=torch.long)
-    pages = kv_data.index_select(0, page_indices)
-    k = pages[:, 0].reshape(-1, iController.num_heads, iController.head_dim)
-    v = pages[:, 1].reshape(-1, iController.num_heads, iController.head_dim)
-
-    kv_len = iController.kv_cache.seqlen
-    return k[:kv_len], v[:kv_len]
+    return torch.tensor(iController.kv_cache.indicies, device=device, dtype=torch.int32)
 
 
 def triton_prefill_forward(q: torch.Tensor, iController, layer_idx: int) -> torch.Tensor:
     kernels = _load_triton_module()
-    k, v = _materialize_kv(iController, layer_idx)
-    return kernels.triton_attention(q, k, v)
+    paged_kv = iController.kv_cache.buf_layer(layer_idx)
+    kv_indices = _get_kv_indices(iController, paged_kv.device)
+    kv_len = iController.kv_cache.seqlen
+    return kernels.triton_attention_paged(q, paged_kv, kv_indices, kv_len, iController.page_size)
 
 
 def triton_decode_estimate(q: torch.Tensor, iController, layer_idx: int) -> torch.Tensor:
     kernels = _load_triton_module()
-    k, _ = _materialize_kv(iController, layer_idx)
-    return kernels.triton_page_estimate(q, k, iController.page_size)
+    paged_kv = iController.kv_cache.buf_layer(layer_idx)
+    kv_indices = _get_kv_indices(iController, paged_kv.device)
+    kv_len = iController.kv_cache.seqlen
+    return kernels.triton_page_estimate_paged(q, paged_kv, kv_indices, kv_len, iController.page_size)
 
 
 def triton_decode_topk(estimated_attn_score: torch.Tensor, iController):
@@ -68,9 +63,18 @@ def triton_decode_sparse_attn(
     topk_indices: torch.Tensor,
 ) -> torch.Tensor:
     kernels = _load_triton_module()
-    k, v = _materialize_kv(iController, layer_idx)
+    paged_kv = iController.kv_cache.buf_layer(layer_idx)
+    kv_indices = _get_kv_indices(iController, paged_kv.device)
+    kv_len = iController.kv_cache.seqlen
 
     if topk_indices is None or topk_indices is iController.kv_indices_without_last:
-        return kernels.triton_attention(q, k, v)
+        return kernels.triton_attention_paged(q, paged_kv, kv_indices, kv_len, iController.page_size)
 
-    return kernels.triton_sparse_attention(q, k, v, topk_indices, iController.page_size)
+    return kernels.triton_sparse_attention_paged(
+        q,
+        paged_kv,
+        kv_indices,
+        topk_indices,
+        kv_len,
+        iController.page_size,
+    )

@@ -7,29 +7,29 @@ model="Qwen3-1.7B"
 # 建议先定义好 model 变量，或者确保外部已经定义
 # model="你的模型路径"
 
-for task in "qasper" "narrativeqa" "hotpotqa" "gov_report" "multifieldqa_en" #"triviaqa" 
+for task in   "qasper" #"triviaqa"  "multifieldqa_en" #  "qasper" "narrativeqa" "hotpotqa" "gov_report" 
 do
     echo "========================================================"
     echo ">>> 进入任务: $task"
 
-    # ------------------------------------------------------
-    # 1. 记录 Baseline (第一次运行) 的时间
-    # ------------------------------------------------------
-    start_base=$(date +%s)
+    # # # ------------------------------------------------------
+    # # # 1. 记录 Baseline (第一次运行) 的时间
+    # # # ------------------------------------------------------
+    # start_base=$(date +%s)
     
-    python -u pred.py \
-        --model $model --task $task
+    # python -u pred.py \
+    #     --model $model --task $task
 
-    end_base=$(date +%s)
-    duration_base=$((end_base - start_base))
+    # end_base=$(date +%s)
+    # duration_base=$((end_base - start_base))
     
-    echo "✅ [Baseline] $task 完成 - 耗时: ${duration_base} 秒"
+    # echo "✅ [Baseline] $task 完成 - 耗时: ${duration_base} 秒"
 
 
     # ------------------------------------------------------
     # 2. 循环 budget 进行 Quest 运行
     # ------------------------------------------------------
-    for budget in 512 1024 2048 4096
+    for budget in 1024 #4096 #
     do
         # 3. 记录 Quest (第二次运行) 的时间
         start_quest=$(date +%s)

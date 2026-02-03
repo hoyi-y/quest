@@ -10,6 +10,6 @@
     "Mistral-7B-Instruct-v0.3": 31500, 
     "Meta-Llama-3.1-8B-Instruct": 44750,
     "Qwen3-1.7B": 40960,
-    "Qwen2.5-0.5B-Instruct":32768
+    "Qwen2.5-3B-Instruct":32768
     
 }

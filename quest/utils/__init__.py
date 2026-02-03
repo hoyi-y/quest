@@ -163,8 +163,8 @@ def prefill_forward(
     if rope_theta is None:
         rope_theta = 1e4
 
-    # if _USE_TRITON:
-    #     return triton_prefill_forward(q, iController, layer_idx)
+    if _USE_TRITON:
+        return triton_prefill_forward(q, iController, layer_idx)
 
     f = _kernels.prefill_with_paged_kv_cache
     o = f(

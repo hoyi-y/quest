@@ -2,8 +2,8 @@ from transformers import AutoTokenizer
 import torch
 import argparse
 
-# MODEL_PATH = "/media/8T3/by_lv/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf"
-MODEL_PATH = "/media/8T3/by_lv/work_projects/bishe/models/Llama-2-7b"
+# MODEL_PATH = " /media/8T3/by_lv/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf"
+MODEL_PATH = "/media/8T3/by_lv/learn_programs/models/Qwen3-1.7B"
 DEVICE = torch.device("cuda:0")
 DTYPE = torch.float16
 torch.set_default_dtype(DTYPE)
@@ -20,15 +20,15 @@ parser.add_argument("--token_budget", type=int, default=1024)
 args = parser.parse_args()
 
 if args.method == "quest":
-    from quest.models import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(MODEL_PATH, device_map=DEVICE, torch_dtype=DTYPE)
+    from quest.models import Qwen3ForCausalLM
+    model = Qwen3ForCausalLM.from_pretrained(MODEL_PATH, device_map=DEVICE, dtype=DTYPE)
 
     # Init Quest Controller
     model.quest_init(page_size=16, max_seq_len=8192, token_budget=args.token_budget)
     model.quest_clear()
 else:
-    from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(MODEL_PATH, device_map=DEVICE, torch_dtype=DTYPE)
+    from transformers import Qwen3ForCausalLM
+    model = Qwen3ForCausalLM.from_pretrained(MODEL_PATH, device_map=DEVICE, dtype=DTYPE)
     
     
 # First Round
@@ -37,8 +37,19 @@ inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 print(f"Input Sequence Length: {inputs.input_ids.shape[1]}")
 
 generate_ids = model.generate(
-                            inputs.input_ids,
+                            **inputs,
                             max_length=2048,
                             use_cache=True # Managed by our InferenceController
                             )
+# generate_ids = model.generate(
+#                                 **inputs,
+#                                 max_new_tokens=256,
+#                                 do_sample=True,
+#                                 top_p=0.9,
+#                                 temperature=0.7,
+#                                 repetition_penalty=1.1,
+#                                 use_cache=True,
+#                     )
+
 print(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
+

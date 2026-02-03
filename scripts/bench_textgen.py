@@ -8,7 +8,9 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from quest import LlamaForCausalLM
+from quest import LlamaForCausalLM 
+from quest import Qwen3ForCausalLM 
+from quest.models.qwen3_triton import Qwen3ForCausalLMTriton
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -22,6 +24,11 @@ MODEL_CFGS = {
             model_path="/media/8T3/by_lv/work_projects/bishe/models/Llama-2-7b"
             # /mnt/storage/models/Llama-2-7b-chat-hf
         ),
+    "Qwen3-1.7B":
+        ModelConfig(
+            model_path="/media/8T3/by_lv/learn_programs/models/Qwen3-1.7B"
+            # /mnt/storage/models/Llama-2-7b-chat-hf
+        ),
 }
 
 def load_model(model_cfg: ModelConfig):
@@ -30,17 +37,24 @@ def load_model(model_cfg: ModelConfig):
     torch.set_default_dtype(dtype)
 
     with device:
-        model = LlamaForCausalLM.from_pretrained(
+        # model = LlamaForCausalLM.from_pretrained(
+        #     model_cfg.model_path,
+        #     device_map=device,
+        #     torch_dtype=dtype,
+        # )
+        model = Qwen3ForCausalLM.from_pretrained(
             model_cfg.model_path,
             device_map=device,
             torch_dtype=dtype,
         )
+        
+
     return model
 
 @torch.inference_mode()
 def benchmark_quest():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=MODEL_CFGS.keys(), default="llama2-7b")
+    parser.add_argument("--model", choices=MODEL_CFGS.keys(), default="Qwen3-1.7B")
     parser.add_argument("--context_len", type=int, default=2*1024)
     parser.add_argument("--decode_len", type=int, default=256)
     parser.add_argument("--page_size", type=int, default=16)

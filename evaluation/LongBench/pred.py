@@ -39,7 +39,7 @@ def parse_args(args=None):
             "Mistral-7B-Instruct-v0.3",
             "Meta-Llama-3.1-8B-Instruct",
             "Qwen3-1.7B",
-            "Qwen2.5-0.5B-Instruct",
+            "Qwen2.5-3B-Instruct",
         ],
     )
     parser.add_argument("--e", action="store_true", help="Evaluate on LongBench-E")
